@@ -1,44 +1,31 @@
 """
-Dynamic QR Code Attendance System - SERVER
-Run this on the TEACHER's computer / projector screen.
+Dynamic QR Code Attendance System - WEB APP VERSION
+Deployable on Render / Railway / any cloud host, or run locally + ngrok.
 
-UPGRADES:
-  - Multi-threaded HTTP server
-  - PermissionError fix
-  - Branch & Section field
-  - Late entry warning
-  - Admin panel (view/delete)
-  - Settings screen (change subject, timer, password from UI)
-  - Absent list auto-generated in Excel
-  - Monthly attendance summary sheet
-  - ONE DEVICE ONE SUBMISSION: same phone/device cannot submit twice per subject session
+Opening the root URL "/" goes DIRECTLY to the live QR code page.
+No Tkinter, no desktop GUI - everything runs in the browser.
 """
 
 import qrcode
 import threading
 import time
 import os
-import socket
 import secrets
 import string
-from datetime import datetime, date
+import io
+import base64
+from datetime import datetime
 from calendar import monthrange
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse
+from flask import Flask, request, Response, send_file
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
-from PIL import Image, ImageTk
-import io
 
 
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
 QR_ROTATE_SECONDS  = 30
-SERVER_PORT        = 5050
 EXCEL_FILENAME     = "attendance.xlsx"
 SUBJECT            = "DTL"
 LATE_AFTER_MINUTES = 10
@@ -46,27 +33,17 @@ CLASS_START_TIME   = None
 ADMIN_PASSWORD     = "admin123"
 ROLL_LIST          = []
 
+app = Flask(__name__)
 
 # ─────────────────────────────────────────────
 #  SHARED STATE
 # ─────────────────────────────────────────────
-state_lock        = threading.Lock()
-current_token     = ""
-token_expiry      = 0.0
-attendance_log    = []
-class_start_dt    = None
-submitted_ips     = set()   # IPs that already submitted this session
-
-
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+state_lock     = threading.Lock()
+current_token  = ""
+token_expiry   = 0.0
+attendance_log = []
+class_start_dt = datetime.now()
+submitted_ips  = set()
 
 
 def generate_token(length=12):
@@ -90,10 +67,390 @@ def is_late():
     return (datetime.now() - class_start_dt).total_seconds() / 60 > LATE_AFTER_MINUTES
 
 
-# ─────────────────────────────────────────────
-#  HTML TEMPLATES
-# ─────────────────────────────────────────────
-HTML_FORM = """<!DOCTYPE html>
+def get_client_ip():
+    """Get real client IP even behind a proxy (Render/Railway use X-Forwarded-For)."""
+    if request.headers.get("X-Forwarded-For"):
+        return request.headers.get("X-Forwarded-For").split(",")[0].strip()
+    return request.remote_addr
+
+
+def make_qr_base64(url):
+    """Generate a QR code and return it as a base64 PNG data URI."""
+    qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_H,
+                       box_size=8, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{b64}"
+
+
+# ══════════════════════════════════════════════
+#  ROUTE: "/"  -->  Teacher's live QR display page
+#  Opening this URL goes DIRECTLY to the QR page.
+# ══════════════════════════════════════════════
+@app.route("/")
+def teacher_qr_page():
+    base_url = request.url_root.rstrip("/")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{SUBJECT} - Attendance QR</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Attendance">
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{
+    font-family:-apple-system,'Segoe UI',sans-serif;
+    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
+    min-height:100vh; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; padding:20px; color:white;
+  }}
+  h1 {{ font-size:18px; font-weight:700; margin-bottom:4px; text-align:center; }}
+  .sub {{ font-size:13px; color:#94a3b8; margin-bottom:20px; text-align:center; }}
+  .qr-box {{
+    background:white; border-radius:20px; padding:16px;
+    box-shadow:0 20px 60px rgba(0,0,0,0.5); margin-bottom:20px;
+  }}
+  .qr-box img {{ width:260px; height:260px; display:block; }}
+  .timer {{ font-size:40px; font-weight:800; color:#38bdf8; margin-bottom:6px; }}
+  .bar {{ width:260px; height:6px; background:#1e293b; border-radius:3px; overflow:hidden; margin-bottom:24px; }}
+  .bar-fill {{ height:100%; background:#38bdf8; transition:width 0.25s linear; }}
+  .stats {{ display:flex; gap:24px; margin-bottom:20px; }}
+  .stat {{ text-align:center; }}
+  .stat .n {{ font-size:28px; font-weight:800; }}
+  .stat .l {{ font-size:11px; color:#94a3b8; text-transform:uppercase; }}
+  .present {{ color:#4ade80; }} .late {{ color:#fbbf24; }} .device {{ color:#a78bfa; }}
+  .footer-btn {{
+    margin-top:10px; padding:10px 20px; background:rgba(255,255,255,0.1);
+    border:1px solid rgba(255,255,255,0.2); border-radius:10px; color:white;
+    text-decoration:none; font-size:13px; font-weight:600;
+  }}
+</style>
+</head>
+<body>
+  <h1>&#x1F4CB; {SUBJECT}</h1>
+  <div class="sub" id="dateline"></div>
+  <div class="qr-box"><img id="qrimg" src="" alt="QR Code"></div>
+  <div class="timer" id="timer">--</div>
+  <div class="bar"><div class="bar-fill" id="barfill" style="width:100%"></div></div>
+  <div class="stats">
+    <div class="stat"><div class="n present" id="cnt-present">0</div><div class="l">Present</div></div>
+    <div class="stat"><div class="n late" id="cnt-late">0</div><div class="l">Late</div></div>
+    <div class="stat"><div class="n device" id="cnt-device">0</div><div class="l">Devices</div></div>
+  </div>
+  <a class="footer-btn" href="/admin">Admin Panel</a>
+  <button class="footer-btn" onclick="location.reload()" style="margin-top:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);cursor:pointer;font-family:inherit;">Force Refresh</button>
+
+<script>
+const ROTATE = {QR_ROTATE_SECONDS};
+document.getElementById('dateline').textContent = new Date().toLocaleDateString('en-IN', {{weekday:'long', day:'numeric', month:'long', year:'numeric'}});
+
+let serverRemaining = ROTATE;
+let lastSync = Date.now();
+let lastTokenQR = "";
+let refreshing = false;
+let refreshStartedAt = 0;
+
+async function refresh() {{
+  if (refreshing) return;
+  refreshing = true;
+  refreshStartedAt = Date.now();
+  try {{
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // hard 8s timeout
+    const res = await fetch('/api/state', {{cache: 'no-store', signal: controller.signal}});
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error('Bad response: ' + res.status);
+    const data = await res.json();
+    if (data.qr !== lastTokenQR) {{
+      document.getElementById('qrimg').src = data.qr;
+      lastTokenQR = data.qr;
+    }}
+    document.getElementById('cnt-present').textContent = data.present;
+    document.getElementById('cnt-late').textContent = data.late;
+    document.getElementById('cnt-device').textContent = data.devices;
+    serverRemaining = data.remaining;
+    lastSync = Date.now();
+  }} catch(e) {{
+    console.error('refresh failed:', e);
+  }} finally {{
+    refreshing = false;
+  }}
+}}
+
+function tick() {{
+  // Failsafe: if a refresh call has been "in progress" for more than 10s,
+  // something went wrong (e.g. Render cold-start hang) - force-unstick it.
+  if (refreshing && (Date.now() - refreshStartedAt) > 10000) {{
+    refreshing = false;
+  }}
+
+  const elapsed = (Date.now() - lastSync) / 1000;
+  let remaining = serverRemaining - elapsed;
+  if (remaining <= 0.2 && !refreshing) {{
+    refresh();
+  }}
+  document.getElementById('timer').textContent = Math.max(0, Math.ceil(remaining)) + 's';
+  document.getElementById('barfill').style.width = (Math.max(0, Math.min(100, remaining / ROTATE * 100))) + '%';
+}}
+
+refresh();
+setInterval(tick, 250);
+// Absolute safety net: every 4s, force a refresh attempt regardless of flag state.
+setInterval(() => {{ refreshing = false; refresh(); }}, 4000);
+
+// re-sync immediately when the tab/screen becomes visible again
+// (fixes the "QR expired" issue caused by phone screen sleep / background throttling)
+document.addEventListener('visibilitychange', () => {{
+  if (!document.hidden) refresh();
+}});
+</script>
+</body>
+</html>"""
+    return html
+
+
+@app.route("/manifest.json")
+def manifest():
+    return Response('''{
+  "name": "Attendance QR",
+  "short_name": "Attendance",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#0f3460"
+}''', mimetype="application/json")
+
+
+# ══════════════════════════════════════════════
+#  API: live state for the teacher page (polled by JS)
+# ══════════════════════════════════════════════
+@app.route("/api/state")
+def api_state():
+    base_url = request.url_root.rstrip("/")
+    with state_lock:
+        token   = current_token
+        expiry  = token_expiry
+        today = datetime.now().strftime("%Y-%m-%d")
+        present = sum(1 for r in attendance_log if r["Date"] == today and r["Status"] == "Present")
+        late    = sum(1 for r in attendance_log if r["Date"] == today and r["Status"] == "Late")
+        devices = len(submitted_ips)
+    student_url = f"{base_url}/scan?token={token}"
+    qr_data = make_qr_base64(student_url)
+    remaining = max(0, round(expiry - time.time(), 1))
+    return {"qr": qr_data, "present": present, "late": late, "devices": devices,
+            "remaining": remaining, "rotate_seconds": QR_ROTATE_SECONDS}
+
+
+# ══════════════════════════════════════════════
+#  ROUTE: /scan  -->  Student attendance form
+# ══════════════════════════════════════════════
+@app.route("/scan")
+def student_form():
+    token_param = request.args.get("token", "")
+    with state_lock:
+        valid  = (token_param == current_token and time.time() < token_expiry)
+        expiry = token_expiry
+
+    if not valid:
+        return EXPIRED_HTML, 403
+
+    remaining = max(0, int(expiry - time.time()))
+    late_banner = '<div class="late-badge">You are marking attendance late!</div>' if is_late() else ""
+    return FORM_HTML.format(
+        token=token_param,
+        date=datetime.now().strftime("%d %B %Y"),
+        subject=SUBJECT,
+        interval=remaining,
+        late_banner=late_banner
+    )
+
+
+@app.route("/submit", methods=["POST"])
+def submit():
+    token_param = request.args.get("token", "")
+    with state_lock:
+        valid = (token_param == current_token and time.time() < token_expiry)
+    if not valid:
+        return EXPIRED_HTML, 403
+
+    client_ip = get_client_ip()
+    with state_lock:
+        if client_ip in submitted_ips:
+            return DEVICE_BLOCKED_HTML.format(subject=SUBJECT)
+
+    usn     = request.form.get("usn", "").strip().upper()
+    name    = request.form.get("name", "").strip().title()
+    branch  = request.form.get("branch", "").strip()
+    section = request.form.get("section", "").strip()
+    today   = datetime.now().strftime("%Y-%m-%d")
+
+    if not usn or not name or not branch or not section:
+        return "<h2 style='font-family:sans-serif;padding:20px'>Please fill all fields.</h2>", 400
+
+    with state_lock:
+        dup = next((r for r in attendance_log if r["USN"] == usn and r["Date"] == today), None)
+        if dup:
+            return DUPLICATE_HTML.format(usn=usn, time=dup["Time"])
+
+        status = "Late" if is_late() else "Present"
+        record = {
+            "USN": usn, "Name": name, "Branch": branch, "Section": section,
+            "Date": today, "Time": datetime.now().strftime("%H:%M:%S"),
+            "Subject": SUBJECT, "Status": status
+        }
+        attendance_log.append(record)
+        submitted_ips.add(client_ip)
+
+    save_to_excel(record)
+
+    return SUCCESS_HTML.format(
+        icon="&#x2705;" if status == "Present" else "&#x23F0;",
+        status_class="ok" if status == "Present" else "late",
+        badge_class="badge-present" if status == "Present" else "badge-late",
+        status=status, usn=usn, name=name, branch=branch, section=section,
+        date=datetime.now().strftime("%d %B %Y"), subject=SUBJECT
+    )
+
+
+# ══════════════════════════════════════════════
+#  ADMIN PANEL
+# ══════════════════════════════════════════════
+@app.route("/admin")
+def admin_login_or_panel():
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return ADMIN_LOGIN_HTML
+    return build_admin_html()
+
+
+@app.route("/admin/delete")
+def admin_delete():
+    pwd = request.args.get("pwd", "")
+    usn = request.args.get("usn", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+    today = datetime.now().strftime("%Y-%m-%d")
+    with state_lock:
+        before = len(attendance_log)
+        attendance_log[:] = [r for r in attendance_log if not (r["USN"] == usn and r["Date"] == today)]
+        removed = before - len(attendance_log)
+    if removed:
+        rebuild_excel_for_today()
+    return f"<meta http-equiv='refresh' content='0;url=/admin?pwd={pwd}'>"
+
+
+@app.route("/admin/reset_devices")
+def admin_reset_devices():
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+    with state_lock:
+        submitted_ips.clear()
+    return f"<meta http-equiv='refresh' content='0;url=/admin?pwd={pwd}'>"
+
+
+@app.route("/admin/absent")
+def admin_absent():
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+    if not ROLL_LIST:
+        return f"<meta http-equiv='refresh' content='2;url=/admin?pwd={pwd}'><p style='font-family:sans-serif;padding:20px;color:white;background:#0f172a'>Roll list is empty. Add USNs in Settings first.</p>"
+    count = generate_absent_list()
+    msg = f"{count} student(s) marked Absent." if count else "All students already marked attendance."
+    return f"<meta http-equiv='refresh' content='2;url=/admin?pwd={pwd}'><p style='font-family:sans-serif;padding:20px;color:white;background:#0f172a'>{msg}</p>"
+
+
+@app.route("/admin/monthly")
+def admin_monthly():
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+    ok = generate_monthly_summary()
+    msg = "Monthly Summary created! Download Excel to view." if ok else "No attendance data for this month yet."
+    return f"<meta http-equiv='refresh' content='2;url=/admin?pwd={pwd}'><p style='font-family:sans-serif;padding:20px;color:white;background:#0f172a'>{msg}</p>"
+
+
+@app.route("/admin/settings", methods=["GET", "POST"])
+def admin_settings():
+    global SUBJECT, QR_ROTATE_SECONDS, LATE_AFTER_MINUTES, ADMIN_PASSWORD, CLASS_START_TIME, ROLL_LIST, class_start_dt
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+
+    if request.method == "POST":
+        try:
+            new_subject  = request.form.get("subject", "").strip()
+            new_rotate   = int(request.form.get("rotate", "30"))
+            new_late     = int(request.form.get("late", "10"))
+            new_password = request.form.get("password", "").strip()
+            new_start    = request.form.get("start", "").strip()
+            new_rolls    = [u.strip().upper() for u in request.form.get("roll_list", "").splitlines() if u.strip()]
+            if not new_subject or not new_password:
+                raise ValueError("Subject and password required")
+            SUBJECT = new_subject; QR_ROTATE_SECONDS = new_rotate; LATE_AFTER_MINUTES = new_late
+            ADMIN_PASSWORD = new_password; CLASS_START_TIME = new_start if new_start else None
+            ROLL_LIST = new_rolls
+            if CLASS_START_TIME:
+                h, m = map(int, CLASS_START_TIME.split(":"))
+                class_start_dt = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+            else:
+                class_start_dt = datetime.now()
+            return f"<meta http-equiv='refresh' content='1;url=/admin?pwd={ADMIN_PASSWORD}&tab=settings'>"
+        except Exception as e:
+            return f"<p style='font-family:sans-serif;padding:20px;color:red'>Error: {e}</p>"
+
+    return build_admin_html()
+
+
+@app.route("/download/excel")
+def download_excel():
+    pwd = request.args.get("pwd", "")
+    if pwd != ADMIN_PASSWORD:
+        return "Unauthorized", 401
+    if not os.path.exists(EXCEL_FILENAME):
+        return "No attendance file yet.", 404
+    return send_file(EXCEL_FILENAME, as_attachment=True, download_name="attendance.xlsx")
+
+
+def build_admin_html():
+    today = datetime.now().strftime("%Y-%m-%d")
+    with state_lock:
+        records      = [r for r in attendance_log if r["Date"] == today]
+        device_count = len(submitted_ips)
+    rows = ""
+    for i, r in enumerate(records, 1):
+        sc = "late" if r["Status"] == "Late" else ("absent" if r["Status"] == "Absent" else "present")
+        del_btn = (f"<button class='del-btn' onclick=\"location.href='/admin/delete?pwd={ADMIN_PASSWORD}&usn={r['USN']}'\">Delete</button>"
+                   if r["Status"] != "Absent" else "—")
+        rows += (f"<tr><td>{i}</td><td>{r['USN']}</td><td>{r['Name']}</td>"
+                 f"<td>{r['Branch']}</td><td>{r['Section']}</td><td>{r['Time']}</td>"
+                 f"<td class='{sc}'>{r['Status']}</td><td>{del_btn}</td></tr>")
+    present = sum(1 for r in records if r["Status"] == "Present")
+    late    = sum(1 for r in records if r["Status"] == "Late")
+    absent  = sum(1 for r in records if r["Status"] == "Absent")
+
+    return ADMIN_HTML.format(
+        subject=SUBJECT, date=datetime.now().strftime("%d %B %Y"), pwd=ADMIN_PASSWORD,
+        rows=rows if rows else "<tr><td colspan='8' style='text-align:center;padding:20px;color:#64748b'>No records yet</td></tr>",
+        total=len(records), present=present, late=late, absent=absent, device_count=device_count,
+        subject_val=SUBJECT, rotate_val=QR_ROTATE_SECONDS, late_val=LATE_AFTER_MINUTES,
+        password_val=ADMIN_PASSWORD, start_val=CLASS_START_TIME or "", roll_val="\n".join(ROLL_LIST)
+    )
+
+
+# ══════════════════════════════════════════════
+#  HTML TEMPLATES (student-facing + admin)
+# ══════════════════════════════════════════════
+FORM_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -102,52 +459,29 @@ HTML_FORM = """<!DOCTYPE html>
 <style>
   * {{ box-sizing:border-box; margin:0; padding:0; }}
   body {{
-    font-family:'Segoe UI',sans-serif;
+    font-family:-apple-system,'Segoe UI',sans-serif;
     background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
     min-height:100vh; display:flex; align-items:center;
     justify-content:center; padding:20px;
   }}
-  .card {{
-    background:white; border-radius:16px; padding:36px 32px;
-    width:100%; max-width:420px; box-shadow:0 20px 60px rgba(0,0,0,0.4);
-  }}
+  .card {{ background:white; border-radius:16px; padding:36px 32px; width:100%; max-width:420px; box-shadow:0 20px 60px rgba(0,0,0,0.4); }}
   .logo {{ text-align:center; margin-bottom:20px; }}
   .logo h1 {{ font-size:22px; color:#1a1a2e; font-weight:700; }}
-  .logo p  {{ font-size:13px; color:#888; margin-top:4px; }}
-  .late-badge {{
-    background:#fef3c7; color:#92400e; border:1px solid #fde68a;
-    border-radius:8px; padding:8px 12px; font-size:13px;
-    text-align:center; margin-bottom:16px; font-weight:600;
-  }}
+  .logo p {{ font-size:13px; color:#888; margin-top:4px; }}
+  .late-badge {{ background:#fef3c7; color:#92400e; border:1px solid #fde68a; border-radius:8px; padding:8px 12px; font-size:13px; text-align:center; margin-bottom:16px; font-weight:600; }}
   label {{ display:block; font-size:13px; font-weight:600; color:#444; margin-bottom:6px; }}
-  input, select {{
-    width:100%; padding:11px 14px; border:1.5px solid #ddd;
-    border-radius:8px; font-size:15px; margin-bottom:16px;
-    transition:border 0.2s; background:white;
-  }}
+  input, select {{ width:100%; padding:11px 14px; border:1.5px solid #ddd; border-radius:8px; font-size:15px; margin-bottom:16px; background:white; }}
   input:focus, select:focus {{ outline:none; border-color:#0f3460; }}
-  .row {{ display:flex; gap:12px; }}
-  .row > div {{ flex:1; }}
-  button {{
-    width:100%; padding:13px; background:#0f3460;
-    color:white; border:none; border-radius:8px;
-    font-size:16px; font-weight:600; cursor:pointer;
-  }}
-  button:hover {{ background:#1a4a8a; }}
+  .row {{ display:flex; gap:12px; }} .row > div {{ flex:1; }}
+  button {{ width:100%; padding:13px; background:#0f3460; color:white; border:none; border-radius:8px; font-size:16px; font-weight:600; cursor:pointer; }}
   .timer-bar {{ height:4px; background:#e5e7eb; border-radius:2px; overflow:hidden; margin-bottom:20px; }}
-  .timer-fill {{
-    height:100%; background:#0f3460;
-    animation:drain {interval}s linear forwards;
-  }}
+  .timer-fill {{ height:100%; background:#0f3460; animation:drain {interval}s linear forwards; }}
   @keyframes drain {{ from{{width:100%}} to{{width:0%}} }}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="logo">
-    <h1>&#x1F4CB; Mark Attendance</h1>
-    <p>{date} &nbsp;|&nbsp; {subject}</p>
-  </div>
+  <div class="logo"><h1>&#x1F4CB; Mark Attendance</h1><p>{date} &nbsp;|&nbsp; {subject}</p></div>
   <div class="timer-bar"><div class="timer-fill"></div></div>
   {late_banner}
   <form method="POST" action="/submit?token={token}">
@@ -156,31 +490,22 @@ HTML_FORM = """<!DOCTYPE html>
     <label>Full Name</label>
     <input name="name" type="text" placeholder="e.g. Rahul Sharma" required>
     <div class="row">
-      <div>
-        <label>Branch</label>
+      <div><label>Branch</label>
         <select name="branch" required>
           <option value="" disabled selected>Select</option>
-          <option value="CSE">CSE</option>
-          <option value="ETE">ETE</option>
-          <option value="ISE">ISE</option>
-          <option value="ECE">ECE</option>
-          <option value="EEE">EEE</option>
-          <option value="ME">ME</option>
-          <option value="CV">CV</option>
-          <option value="AI&ML">AI&amp;ML</option>
+          <option value="CSE">CSE</option><option value="ETE">ETE</option>
+          <option value="ISE">ISE</option><option value="ECE">ECE</option>
+          <option value="EEE">EEE</option><option value="ME">ME</option>
+          <option value="CV">CV</option><option value="AI&ML">AI&amp;ML</option>
           <option value="Other">Other</option>
         </select>
       </div>
-      <div>
-        <label>Section</label>
+      <div><label>Section</label>
         <select name="section" required>
           <option value="" disabled selected>Select</option>
           <option value="No Section">No Section</option>
-          <option value="A">A</option>
-          <option value="B">B</option>
-          <option value="C">C</option>
-          <option value="D">D</option>
-          <option value="E">E</option>
+          <option value="A">A</option><option value="B">B</option>
+          <option value="C">C</option><option value="D">D</option><option value="E">E</option>
         </select>
       </div>
     </div>
@@ -190,303 +515,168 @@ HTML_FORM = """<!DOCTYPE html>
 </body>
 </html>"""
 
-HTML_SUCCESS = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Attendance Marked</title>
+SUCCESS_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Attendance Marked</title>
 <style>
-  body {{ font-family:'Segoe UI',sans-serif;
-    background:linear-gradient(135deg,#1a1a2e,#0f3460);
-    display:flex;align-items:center;justify-content:center;min-height:100vh; }}
+  body {{ font-family:-apple-system,sans-serif; background:linear-gradient(135deg,#1a1a2e,#0f3460); display:flex;align-items:center;justify-content:center;min-height:100vh; }}
   .card {{ background:white;border-radius:16px;padding:40px 32px;text-align:center;max-width:400px; }}
-  .icon {{ font-size:60px; margin-bottom:12px; }}
-  h2 {{ font-size:22px; }}
+  .icon {{ font-size:60px; margin-bottom:12px; }} h2 {{ font-size:22px; }}
   .ok {{ color:#16a34a; }} .late {{ color:#d97706; }}
   p {{ color:#555; margin-top:8px; font-size:14px; }}
   .badge {{ display:inline-block;margin-top:12px;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600; }}
-  .badge-present {{ background:#d1fae5; color:#065f46; }}
-  .badge-late    {{ background:#fef3c7; color:#92400e; }}
-</style>
-</head>
-<body>
-<div class="card">
+  .badge-present {{ background:#d1fae5; color:#065f46; }} .badge-late {{ background:#fef3c7; color:#92400e; }}
+</style></head>
+<body><div class="card">
   <div class="icon">{icon}</div>
   <h2 class="{status_class}">Attendance Marked!</h2>
   <p><strong>{usn}</strong> &mdash; {name}</p>
   <p>{branch} &nbsp;|&nbsp; Section: {section}</p>
   <p style="margin-top:8px;color:#888">{date} &nbsp; {subject}</p>
   <span class="badge {badge_class}">{status}</span>
-</div>
-</body>
-</html>"""
+</div></body></html>"""
 
-HTML_EXPIRED = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>QR Expired</title>
+EXPIRED_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>QR Expired</title>
 <style>
-  body {{ font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#7f1d1d,#991b1b);
-    display:flex;align-items:center;justify-content:center;min-height:100vh; }}
+  body {{ font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#7f1d1d,#991b1b);display:flex;align-items:center;justify-content:center;min-height:100vh; }}
   .card {{ background:white;border-radius:16px;padding:40px;text-align:center;max-width:360px; }}
-  .icon {{ font-size:60px; }} h2 {{ color:#dc2626;margin-top:12px; }}
-  p {{ color:#555;margin-top:8px;font-size:14px; }}
-</style></head>
-<body><div class="card">
-  <div class="icon">&#x23F1;&#xFE0F;</div>
-  <h2>QR Code Expired</h2>
+  .icon {{ font-size:60px; }} h2 {{ color:#dc2626;margin-top:12px; }} p {{ color:#555;margin-top:8px;font-size:14px; }}
+</style></head><body><div class="card">
+  <div class="icon">&#x23F1;&#xFE0F;</div><h2>QR Code Expired</h2>
   <p>Please scan the latest QR code shown on the screen.</p>
 </div></body></html>"""
 
-HTML_DUPLICATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Already Marked</title>
+DUPLICATE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Already Marked</title>
 <style>
-  body {{ font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#1e3a5f,#0f3460);
-    display:flex;align-items:center;justify-content:center;min-height:100vh; }}
+  body {{ font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#1e3a5f,#0f3460);display:flex;align-items:center;justify-content:center;min-height:100vh; }}
   .card {{ background:white;border-radius:16px;padding:40px;text-align:center;max-width:360px; }}
-  .icon {{ font-size:60px; }} h2 {{ color:#d97706;margin-top:12px; }}
-  p {{ color:#555;margin-top:8px;font-size:14px; }}
-</style></head>
-<body><div class="card">
-  <div class="icon">&#x26A0;&#xFE0F;</div>
-  <h2>Already Marked</h2>
+  .icon {{ font-size:60px; }} h2 {{ color:#d97706;margin-top:12px; }} p {{ color:#555;margin-top:8px;font-size:14px; }}
+</style></head><body><div class="card">
+  <div class="icon">&#x26A0;&#xFE0F;</div><h2>Already Marked</h2>
   <p><strong>{usn}</strong> already marked at <strong>{time}</strong> today.</p>
 </div></body></html>"""
 
-HTML_DEVICE_BLOCKED = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Device Already Used</title>
+DEVICE_BLOCKED_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Device Already Used</title>
 <style>
-  body {{ font-family:'Segoe UI',sans-serif;
-    background:linear-gradient(135deg,#312e81,#4338ca);
-    display:flex;align-items:center;justify-content:center;min-height:100vh; }}
+  body {{ font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#312e81,#4338ca);display:flex;align-items:center;justify-content:center;min-height:100vh; }}
   .card {{ background:white;border-radius:16px;padding:40px;text-align:center;max-width:380px; }}
-  .icon {{ font-size:60px; }} h2 {{ color:#4338ca;margin-top:12px; }}
-  p {{ color:#555;margin-top:8px;font-size:14px;line-height:1.6; }}
-  .note {{ margin-top:16px;background:#ede9fe;color:#4338ca;padding:10px 14px;
-           border-radius:8px;font-size:13px;font-weight:600; }}
-</style></head>
-<body><div class="card">
-  <div class="icon">&#x1F4F5;</div>
-  <h2>Device Already Used</h2>
+  .icon {{ font-size:60px; }} h2 {{ color:#4338ca;margin-top:12px; }} p {{ color:#555;margin-top:8px;font-size:14px;line-height:1.6; }}
+  .note {{ margin-top:16px;background:#ede9fe;color:#4338ca;padding:10px 14px;border-radius:8px;font-size:13px;font-weight:600; }}
+</style></head><body><div class="card">
+  <div class="icon">&#x1F4F5;</div><h2>Device Already Used</h2>
   <p>Attendance has already been submitted from this device for <strong>{subject}</strong> today.</p>
-  <p>Each device can only submit attendance once per subject session.</p>
-  <div class="note">If this is a mistake, ask your teacher to reset device locks.</div>
+  <div class="note">Each device can only submit attendance once per session.</div>
 </div></body></html>"""
 
-HTML_ADMIN = """<!DOCTYPE html>
+ADMIN_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Login</title>
+<style>
+  body {{ font-family:-apple-system,sans-serif;background:#0f172a;display:flex;align-items:center;justify-content:center;min-height:100vh;color:white; }}
+  .card {{ background:#1e293b;padding:32px;border-radius:16px;width:300px; }}
+  h2 {{ margin-bottom:16px;color:#38bdf8; }}
+  input {{ width:100%;padding:11px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:white;margin-bottom:12px; }}
+  button {{ width:100%;padding:11px;background:#0f3460;color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer; }}
+</style></head><body>
+<div class="card">
+  <h2>Admin Login</h2>
+  <form method="GET" action="/admin">
+    <input type="password" name="pwd" placeholder="Enter password" required autofocus>
+    <button type="submit">Login</button>
+  </form>
+</div></body></html>"""
+
+ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Panel</title>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin Panel</title>
 <style>
   * {{ box-sizing:border-box;margin:0;padding:0; }}
-  body {{ font-family:'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;padding:24px; }}
-  h1 {{ font-size:20px;margin-bottom:4px;color:#38bdf8; }}
-  .sub {{ font-size:13px;color:#94a3b8;margin-bottom:20px; }}
+  body {{ font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh; }}
+  .topbar {{ background:#0f3460;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px; }}
+  .topbar h1 {{ font-size:18px;color:#38bdf8; }}
+  .topbar span {{ font-size:13px;color:#94a3b8; }}
+  .tabs {{ display:flex;background:#1e293b;padding:0 24px;overflow-x:auto; }}
+  .tab {{ padding:12px 20px;cursor:pointer;font-size:13px;font-weight:600;color:#94a3b8;border-bottom:3px solid transparent;white-space:nowrap; }}
+  .tab.active {{ color:#38bdf8;border-bottom-color:#38bdf8; }}
+  .section {{ display:none;padding:24px; }} .section.active {{ display:block; }}
   table {{ width:100%;border-collapse:collapse;font-size:13px; }}
   th {{ background:#0f3460;padding:10px 12px;text-align:left;color:white; }}
   td {{ padding:9px 12px;border-bottom:1px solid #1e293b; }}
-  tr:hover td {{ background:#1e293b; }}
-  .present {{ color:#4ade80;font-weight:600; }}
-  .late    {{ color:#fbbf24;font-weight:600; }}
-  .absent  {{ color:#f87171;font-weight:600; }}
-  .del-btn {{ background:#7f1d1d;color:white;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px; }}
-  .del-btn:hover {{ background:#991b1b; }}
+  .present {{ color:#4ade80;font-weight:600; }} .late {{ color:#fbbf24;font-weight:600; }} .absent {{ color:#f87171;font-weight:600; }}
+  .del-btn {{ background:#7f1d1d;color:white;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px; }}
   .summary {{ margin-top:16px;font-size:14px;color:#94a3b8;background:#1e293b;padding:12px 16px;border-radius:8px; }}
-  .summary span {{ font-weight:700; }}
   .sp {{ color:#4ade80; }} .sl {{ color:#fbbf24; }} .sa {{ color:#f87171; }}
-  .reset-btn {{
-    display:inline-block;margin-top:16px;padding:10px 20px;
-    background:#312e81;color:white;border:none;border-radius:8px;
-    font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;
-  }}
-  .reset-btn:hover {{ background:#3730a3; }}
-  .device-count {{ font-size:13px;color:#94a3b8;margin-top:8px; }}
-  .device-count span {{ color:#a78bfa;font-weight:700; }}
+  .device-count {{ font-size:13px;color:#94a3b8;margin-top:8px; }} .device-count span {{ color:#a78bfa;font-weight:700; }}
+  .settings-grid {{ display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:700px; }}
+  .field label {{ display:block;font-size:12px;font-weight:600;color:#94a3b8;margin-bottom:6px; }}
+  .field input, .field textarea {{ width:100%;padding:10px 12px;background:#1e293b;border:1.5px solid #334155;border-radius:8px;color:#e2e8f0;font-size:14px; }}
+  .field textarea {{ min-height:120px;font-family:monospace;font-size:12px; }}
+  .save-btn, .reset-btn, .card-btn {{ display:inline-block;margin-top:16px;padding:10px 20px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;color:white; }}
+  .save-btn {{ background:#16a34a; }} .reset-btn {{ background:#312e81; }}
+  .action-cards {{ display:flex;gap:20px;flex-wrap:wrap; }}
+  .card {{ background:#1e293b;border-radius:12px;padding:24px;width:260px;border:1px solid #334155; }}
+  .card h3 {{ font-size:15px;margin-bottom:8px; }} .card p {{ font-size:13px;color:#94a3b8;margin-bottom:8px; }}
+  .btn-amber {{ background:#b45309; }} .btn-teal {{ background:#0e7490; }}
+  h2 {{ font-size:16px;color:#94a3b8;margin-bottom:16px; }}
 </style></head>
 <body>
-<h1>Admin Panel</h1>
-<div class="sub">{subject} &nbsp;|&nbsp; {date}</div>
-<table>
-  <tr><th>#</th><th>USN</th><th>Name</th><th>Branch</th><th>Section</th><th>Time</th><th>Status</th><th>Action</th></tr>
-  {rows}
-</table>
-<div class="summary">
-  Total: <span class="sp">{total}</span> &nbsp;|&nbsp;
-  Present: <span class="sp">{present}</span> &nbsp;|&nbsp;
-  Late: <span class="sl">{late}</span> &nbsp;|&nbsp;
-  Absent: <span class="sa">{absent}</span>
+<div class="topbar"><h1>Admin Panel</h1><span>{subject} | {date}</span></div>
+<div class="tabs">
+  <div class="tab active" onclick="show('att',this)">Attendance</div>
+  <div class="tab" onclick="show('set',this)">Settings</div>
+  <div class="tab" onclick="show('rep',this)">Reports</div>
 </div>
-<div class="device-count">Devices locked this session: <span>{device_count}</span></div>
-<a href="/admin/reset_devices?pwd={pwd}" class="reset-btn"
-   onclick="return confirm('Reset all device locks? Students can submit again from any device.')">
-  Reset Device Locks
-</a>
+<div id="att" class="section active">
+  <h2>Today's Attendance</h2>
+  <table><tr><th>#</th><th>USN</th><th>Name</th><th>Branch</th><th>Sec</th><th>Time</th><th>Status</th><th>Action</th></tr>{rows}</table>
+  <div class="summary">Total: <span class="sp">{total}</span> | Present: <span class="sp">{present}</span> | Late: <span class="sl">{late}</span> | Absent: <span class="sa">{absent}</span></div>
+  <div class="device-count">Devices locked: <span>{device_count}</span></div>
+  <a href="/admin/reset_devices?pwd={pwd}" class="reset-btn" onclick="return confirm('Reset device locks?')">Reset Device Locks</a>
+  <a href="/download/excel?pwd={pwd}" class="reset-btn" style="background:#0f3460">Download Excel</a>
+</div>
+<div id="set" class="section">
+  <h2>Settings</h2>
+  <form method="POST" action="/admin/settings?pwd={pwd}">
+    <div class="settings-grid">
+      <div class="field"><label>Subject</label><input name="subject" value="{subject_val}" required></div>
+      <div class="field"><label>QR Rotate (s)</label><input name="rotate" type="number" value="{rotate_val}" required></div>
+      <div class="field"><label>Late After (min)</label><input name="late" type="number" value="{late_val}" required></div>
+      <div class="field"><label>Admin Password</label><input name="password" type="password" value="{password_val}" required></div>
+      <div class="field"><label>Class Start (HH:MM)</label><input name="start" value="{start_val}" placeholder="09:30"></div>
+    </div>
+    <div class="field" style="margin-top:16px;max-width:700px">
+      <label>Roll List (one USN per line)</label>
+      <textarea name="roll_list">{roll_val}</textarea>
+    </div>
+    <button type="submit" class="save-btn">Save Settings</button>
+  </form>
+</div>
+<div id="rep" class="section">
+  <h2>Reports</h2>
+  <div class="action-cards">
+    <div class="card"><h3>Absent List</h3><p>Mark missing students Absent in Excel.</p>
+      <a href="/admin/absent?pwd={pwd}" class="card-btn btn-amber" onclick="return confirm('Generate absent list?')">Generate</a></div>
+    <div class="card"><h3>Monthly Summary</h3><p>Create attendance % report for the month.</p>
+      <a href="/admin/monthly?pwd={pwd}" class="card-btn btn-teal">Generate</a></div>
+  </div>
+</div>
+<script>
+function show(id, el) {{
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  el.classList.add('active');
+}}
+const p = new URLSearchParams(location.search);
+if (p.get('tab') === 'settings') show('set', document.querySelectorAll('.tab')[1]);
+</script>
 </body></html>"""
 
 
-# ─────────────────────────────────────────────
-#  THREADED HTTP SERVER
-# ─────────────────────────────────────────────
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-
-class AttendanceHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-
-        # ── Admin panel ──────────────────────────────────────────────────
-        if parsed.path == "/admin":
-            pwd = parse_qs(parsed.query).get("pwd", [""])[0]
-            if pwd != ADMIN_PASSWORD:
-                self._send_html(401, "<h2 style='color:red;font-family:sans-serif;padding:20px'>Wrong password.</h2>")
-                return
-            self._send_html(200, self._build_admin_html())
-            return
-
-        # ── Delete entry ─────────────────────────────────────────────────
-        if parsed.path == "/admin/delete":
-            pwd = parse_qs(parsed.query).get("pwd", [""])[0]
-            usn = parse_qs(parsed.query).get("usn", [""])[0]
-            if pwd != ADMIN_PASSWORD:
-                self._send_html(401, "<h2>Unauthorized</h2>")
-                return
-            today = datetime.now().strftime("%Y-%m-%d")
-            with state_lock:
-                before = len(attendance_log)
-                attendance_log[:] = [r for r in attendance_log
-                                     if not (r["USN"] == usn and r["Date"] == today)]
-                removed = before - len(attendance_log)
-            if removed:
-                rebuild_excel_for_today()
-            self._send_html(200, "<meta http-equiv='refresh' content='0;url=/admin?pwd=" + pwd + "'><p>Deleted</p>")
-            return
-
-        # ── Reset device locks ───────────────────────────────────────────
-        if parsed.path == "/admin/reset_devices":
-            pwd = parse_qs(parsed.query).get("pwd", [""])[0]
-            if pwd != ADMIN_PASSWORD:
-                self._send_html(401, "<h2>Unauthorized</h2>")
-                return
-            with state_lock:
-                submitted_ips.clear()
-            self._send_html(200, "<meta http-equiv='refresh' content='0;url=/admin?pwd=" + pwd + "'>"
-                                 "<p>Device locks cleared.</p>")
-            return
-
-        # ── Main attendance form ─────────────────────────────────────────
-        token_param = parse_qs(parsed.query).get("token", [""])[0]
-        with state_lock:
-            valid  = (token_param == current_token and time.time() < token_expiry)
-            token  = current_token
-            expiry = token_expiry
-
-        if not valid:
-            self._send_html(403, HTML_EXPIRED)
-            return
-
-        remaining   = max(0, int(expiry - time.time()))
-        late_banner = '<div class="late-badge">You are marking attendance late!</div>' if is_late() else ""
-        self._send_html(200, HTML_FORM.format(
-            token=token, date=datetime.now().strftime("%d %B %Y"),
-            subject=SUBJECT, interval=remaining, late_banner=late_banner
-        ))
-
-    def do_POST(self):
-        parsed      = urlparse(self.path)
-        token_param = parse_qs(parsed.query).get("token", [""])[0]
-
-        with state_lock:
-            valid = (token_param == current_token and time.time() < token_expiry)
-
-        if not valid:
-            self._send_html(403, HTML_EXPIRED)
-            return
-
-        # ── Device (IP) check ────────────────────────────────────────────
-        client_ip = self.client_address[0]
-        with state_lock:
-            if client_ip in submitted_ips:
-                self._send_html(200, HTML_DEVICE_BLOCKED.format(subject=SUBJECT))
-                return
-
-        length  = int(self.headers.get("Content-Length", 0))
-        body    = self.rfile.read(length).decode()
-        fields  = parse_qs(body)
-        usn     = fields.get("usn",     [""])[0].strip().upper()
-        name    = fields.get("name",    [""])[0].strip().title()
-        branch  = fields.get("branch",  [""])[0].strip()
-        section = fields.get("section", [""])[0].strip()
-        today   = datetime.now().strftime("%Y-%m-%d")
-
-        if not usn or not name or not branch or not section:
-            self._send_html(400, "<h2 style='font-family:sans-serif;padding:20px'>Please fill all fields.</h2>")
-            return
-
-        with state_lock:
-            # USN duplicate check
-            dup = next((r for r in attendance_log if r["USN"] == usn and r["Date"] == today), None)
-            if dup:
-                self._send_html(200, HTML_DUPLICATE.format(usn=usn, time=dup["Time"]))
-                return
-
-            status = "Late" if is_late() else "Present"
-            record = {
-                "USN": usn, "Name": name, "Branch": branch, "Section": section,
-                "Date": today, "Time": datetime.now().strftime("%H:%M:%S"),
-                "Subject": SUBJECT, "Status": status
-            }
-            attendance_log.append(record)
-            submitted_ips.add(client_ip)   # lock this device
-
-        save_to_excel(record)
-        self._send_html(200, HTML_SUCCESS.format(
-            icon="&#x2705;" if status == "Present" else "&#x23F0;",
-            status_class="ok" if status == "Present" else "late",
-            badge_class="badge-present" if status == "Present" else "badge-late",
-            status=status, usn=usn, name=name, branch=branch, section=section,
-            date=datetime.now().strftime("%d %B %Y"), subject=SUBJECT
-        ))
-
-    def _build_admin_html(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        with state_lock:
-            records      = [r for r in attendance_log if r["Date"] == today]
-            device_count = len(submitted_ips)
-        rows = ""
-        for i, r in enumerate(records, 1):
-            sc = "late" if r["Status"] == "Late" else ("absent" if r["Status"] == "Absent" else "present")
-            del_btn = (f"<button class='del-btn' "
-                       f"onclick=\"location.href='/admin/delete?pwd={ADMIN_PASSWORD}&usn={r['USN']}'\""
-                       f">Delete</button>") if r["Status"] != "Absent" else "—"
-            rows += (f"<tr><td>{i}</td><td>{r['USN']}</td><td>{r['Name']}</td>"
-                     f"<td>{r['Branch']}</td><td>{r['Section']}</td><td>{r['Time']}</td>"
-                     f"<td class='{sc}'>{r['Status']}</td><td>{del_btn}</td></tr>")
-        present = sum(1 for r in records if r["Status"] == "Present")
-        late    = sum(1 for r in records if r["Status"] == "Late")
-        absent  = sum(1 for r in records if r["Status"] == "Absent")
-        return HTML_ADMIN.format(
-            subject=SUBJECT, date=datetime.now().strftime("%d %B %Y"),
-            pwd=ADMIN_PASSWORD,
-            rows=rows if rows else "<tr><td colspan='8' style='text-align:center;padding:20px;color:#64748b'>No records yet</td></tr>",
-            total=len(records), present=present, late=late, absent=absent,
-            device_count=device_count
-        )
-
-    def _send_html(self, code, html):
-        data = html.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-
-# ─────────────────────────────────────────────
-#  EXCEL
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  EXCEL FUNCTIONS (same as before)
+# ══════════════════════════════════════════════
 HEADERS      = ["USN", "Name", "Branch", "Section", "Date", "Time", "Subject", "Status"]
 COL_WIDTHS   = [16, 22, 10, 12, 14, 12, 14, 12]
 HEADER_FILL  = PatternFill("solid", start_color="0F3460")
@@ -554,9 +744,7 @@ def _safe_save(wb, path, tmp_path):
         os.replace(tmp_path, path)
     except PermissionError:
         ts = datetime.now().strftime("%H%M%S")
-        fallback = f"attendance_backup_{ts}.xlsx"
-        wb.save(fallback)
-        print(f"[!] {path} is open in Excel. Saved to {fallback} instead.")
+        wb.save(f"attendance_backup_{ts}.xlsx")
     finally:
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
@@ -597,9 +785,6 @@ def rebuild_excel_for_today():
     _safe_save(wb, path, tmp_path)
 
 
-# ─────────────────────────────────────────────
-#  ABSENT LIST GENERATOR
-# ─────────────────────────────────────────────
 def generate_absent_list():
     today = datetime.now().strftime("%Y-%m-%d")
     if not ROLL_LIST:
@@ -618,10 +803,8 @@ def generate_absent_list():
     else:
         ws = wb[today]
     for usn in absent_usns:
-        record = {
-            "USN": usn, "Name": "—", "Branch": "—", "Section": "—",
-            "Date": today, "Time": "—", "Subject": SUBJECT, "Status": "Absent"
-        }
+        record = {"USN": usn, "Name": "—", "Branch": "—", "Section": "—",
+                  "Date": today, "Time": "—", "Subject": SUBJECT, "Status": "Absent"}
         ws.append([record[h] for h in HEADERS])
         _style_row(ws, ws.max_row)
         with state_lock:
@@ -631,9 +814,6 @@ def generate_absent_list():
     return len(absent_usns)
 
 
-# ─────────────────────────────────────────────
-#  MONTHLY SUMMARY GENERATOR
-# ─────────────────────────────────────────────
 def generate_monthly_summary():
     path = EXCEL_FILENAME; tmp_path = EXCEL_FILENAME + ".tmp"
     if not os.path.exists(path):
@@ -644,15 +824,12 @@ def generate_monthly_summary():
     date_sheets  = [s for s in wb.sheetnames if s.startswith(month_prefix)]
     if not date_sheets:
         return False
-    all_usns = {}
-    daily    = {}
+    all_usns = {}; daily = {}
     for sheet_name in date_sheets:
-        ws  = wb[sheet_name]
-        day = {}
+        ws = wb[sheet_name]; day = {}
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row or not row[0]: continue
-            usn    = str(row[0])
-            status = str(row[7]) if row[7] else "—"
+            usn = str(row[0]); status = str(row[7]) if row[7] else "—"
             if status in ("Total Present", "Total Late", "Total Absent"): continue
             all_usns[usn] = {"Name": str(row[1] or "—"), "Branch": str(row[2] or "—"), "Section": str(row[3] or "—")}
             day[usn] = status
@@ -663,348 +840,48 @@ def generate_monthly_summary():
     active_dates = sorted(daily.keys())
     headers = ["USN", "Name", "Branch", "Section"] + active_dates + ["Present", "Late", "Absent", "Total Days", "Attendance %"]
     ms.append(headers)
-    hdr_fill = PatternFill("solid", start_color="0F3460")
-    hdr_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    hdr_fill = PatternFill("solid", start_color="0F3460"); hdr_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
     for col_idx in range(1, len(headers) + 1):
         cell = ms.cell(row=1, column=col_idx)
-        cell.font = hdr_font; cell.fill = hdr_fill
-        cell.alignment = CENTER; cell.border = BORDER
+        cell.font = hdr_font; cell.fill = hdr_fill; cell.alignment = CENTER; cell.border = BORDER
         ms.column_dimensions[cell.column_letter].width = 14 if col_idx > 4 else 18
-    pct_red    = PatternFill("solid", start_color="FEE2E2")
-    pct_yellow = PatternFill("solid", start_color="FEF3C7")
-    pct_green  = PatternFill("solid", start_color="D1FAE5")
+    pct_red = PatternFill("solid", start_color="FEE2E2"); pct_yellow = PatternFill("solid", start_color="FEF3C7"); pct_green = PatternFill("solid", start_color="D1FAE5")
     for usn, info in sorted(all_usns.items()):
         row_data = [usn, info["Name"], info["Branch"], info["Section"]]
         p = l = a = 0
         for d in active_dates:
-            st = daily[d].get(usn, "Absent")
-            row_data.append(st)
+            st = daily[d].get(usn, "Absent"); row_data.append(st)
             if st == "Present": p += 1
-            elif st == "Late":  l += 1
-            else:               a += 1
+            elif st == "Late": l += 1
+            else: a += 1
         total = len(active_dates)
-        pct   = round((p + l) / total * 100, 1) if total else 0
+        pct = round((p + l) / total * 100, 1) if total else 0
         row_data += [p, l, a, total, f"{pct}%"]
-        ms.append(row_data)
-        rn = ms.max_row
+        ms.append(row_data); rn = ms.max_row
         for ci in range(1, len(row_data) + 1):
             cell = ms.cell(row=rn, column=ci)
             cell.font = CELL_FONT; cell.border = BORDER; cell.alignment = CENTER
             val = cell.value
-            if val == "Present":  cell.fill = PRESENT_FILL
-            elif val == "Late":   cell.fill = LATE_FILL
+            if val == "Present": cell.fill = PRESENT_FILL
+            elif val == "Late": cell.fill = LATE_FILL
             elif val == "Absent": cell.fill = ABSENT_FILL
         pct_cell = ms.cell(row=rn, column=len(headers))
-        if pct < 75:   pct_cell.fill = pct_red
+        if pct < 75: pct_cell.fill = pct_red
         elif pct < 85: pct_cell.fill = pct_yellow
-        else:          pct_cell.fill = pct_green
+        else: pct_cell.fill = pct_green
         pct_cell.font = Font(bold=True, name="Arial", size=10)
     ms.freeze_panes = "E2"
     _safe_save(wb, path, tmp_path)
     return True
 
 
-# ─────────────────────────────────────────────
-#  SETTINGS DIALOG
-# ─────────────────────────────────────────────
-class SettingsDialog(tk.Toplevel):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self.result = None
-        self.title("Settings")
-        self.configure(bg="#1a1a2e")
-        self.resizable(False, False)
-        self.grab_set()
-        self._build()
-
-    def _build(self):
-        tk.Label(self, text="Settings", font=("Segoe UI", 14, "bold"),
-                 fg="white", bg="#1a1a2e").pack(pady=(16, 4))
-        tk.Label(self, text="Changes apply immediately after Save",
-                 font=("Segoe UI", 9), fg="#94a3b8", bg="#1a1a2e").pack(pady=(0, 12))
-        frame = tk.Frame(self, bg="#1a1a2e")
-        frame.pack(padx=20, pady=6)
-        fields = [
-            ("Subject Name",                     "subject",  SUBJECT),
-            ("QR Rotate (seconds)",              "rotate",   str(QR_ROTATE_SECONDS)),
-            ("Late After (minutes)",             "late",     str(LATE_AFTER_MINUTES)),
-            ("Admin Password",                   "password", ADMIN_PASSWORD),
-            ("Class Start Time (HH:MM or blank)","start",    CLASS_START_TIME or ""),
-        ]
-        self.vars = {}
-        for label, key, default in fields:
-            row = tk.Frame(frame, bg="#1a1a2e")
-            row.pack(fill="x", pady=4)
-            tk.Label(row, text=label, font=("Segoe UI", 10), fg="#94a3b8",
-                     bg="#1a1a2e", width=32, anchor="w").pack(side="left")
-            var  = tk.StringVar(value=default)
-            show = "*" if key == "password" else ""
-            tk.Entry(row, textvariable=var, font=("Segoe UI", 11),
-                     width=18, show=show).pack(side="left")
-            self.vars[key] = var
-        tk.Label(frame, text="Class Roll List (one USN per line):",
-                 font=("Segoe UI", 10), fg="#94a3b8", bg="#1a1a2e",
-                 anchor="w").pack(fill="x", pady=(10, 4))
-        self.roll_text = tk.Text(frame, height=6, width=50,
-                                 font=("Consolas", 9), bg="#0f172a", fg="#e2e8f0")
-        self.roll_text.pack()
-        self.roll_text.insert("end", "\n".join(ROLL_LIST))
-        btn_frame = tk.Frame(self, bg="#1a1a2e", pady=14)
-        btn_frame.pack()
-        tk.Button(btn_frame, text="Save", command=self._save,
-                  font=("Segoe UI", 10, "bold"), bg="#16a34a", fg="white",
-                  relief="flat", padx=16, pady=8, cursor="hand2").pack(side="left", padx=6)
-        tk.Button(btn_frame, text="Cancel", command=self.destroy,
-                  font=("Segoe UI", 10, "bold"), bg="#7f1d1d", fg="white",
-                  relief="flat", padx=16, pady=8, cursor="hand2").pack(side="left", padx=6)
-
-    def _save(self):
-        global SUBJECT, QR_ROTATE_SECONDS, LATE_AFTER_MINUTES, ADMIN_PASSWORD, CLASS_START_TIME, ROLL_LIST, class_start_dt
-        try:
-            rotate = int(self.vars["rotate"].get())
-            late   = int(self.vars["late"].get())
-        except ValueError:
-            messagebox.showerror("Error", "Rotate and Late must be whole numbers.", parent=self)
-            return
-        subj  = self.vars["subject"].get().strip()
-        pwd   = self.vars["password"].get().strip()
-        start = self.vars["start"].get().strip()
-        rolls = [u.strip().upper() for u in self.roll_text.get("1.0", "end").splitlines() if u.strip()]
-        if not subj or not pwd:
-            messagebox.showerror("Error", "Subject and Password cannot be empty.", parent=self)
-            return
-        SUBJECT = subj; QR_ROTATE_SECONDS = rotate; LATE_AFTER_MINUTES = late
-        ADMIN_PASSWORD = pwd; CLASS_START_TIME = start if start else None; ROLL_LIST = rolls
-        if CLASS_START_TIME:
-            h, m = map(int, CLASS_START_TIME.split(":"))
-            class_start_dt = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-        else:
-            class_start_dt = datetime.now()
-        self.result = True
-        self.destroy()
-        messagebox.showinfo("Saved", f"Settings saved!\nSubject: {SUBJECT}\nQR Rotate: {QR_ROTATE_SECONDS}s")
-
-
-# ─────────────────────────────────────────────
-#  TKINTER GUI
-# ─────────────────────────────────────────────
-class AttendanceApp(tk.Tk):
-    def __init__(self, server_ip):
-        super().__init__()
-        self.server_ip = server_ip
-        self.title("Dynamic QR Attendance System")
-        self.configure(bg="#1a1a2e")
-        self.resizable(False, False)
-        self._build_ui()
-        self._refresh_qr()
-        self._tick()
-
-    def _build_ui(self):
-        hdr = tk.Frame(self, bg="#0f3460", pady=12)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Dynamic QR Attendance System",
-                 font=("Segoe UI", 16, "bold"), fg="white", bg="#0f3460").pack()
-        self.hdr_sub = tk.Label(hdr,
-                 text=f"Subject: {SUBJECT}  |  {datetime.now().strftime('%A, %d %B %Y')}  |  Late after {LATE_AFTER_MINUTES} mins",
-                 font=("Segoe UI", 10), fg="#94a3b8", bg="#0f3460")
-        self.hdr_sub.pack(pady=(2, 0))
-
-        body = tk.Frame(self, bg="#1a1a2e", padx=20, pady=16)
-        body.pack()
-
-        qr_frame = tk.Frame(body, bg="#ffffff", padx=10, pady=10,
-                            highlightthickness=2, highlightbackground="#0f3460")
-        qr_frame.grid(row=0, column=0, padx=(0, 20))
-        self.qr_label = tk.Label(qr_frame, bg="white")
-        self.qr_label.pack()
-
-        right = tk.Frame(body, bg="#1a1a2e")
-        right.grid(row=0, column=1, sticky="n")
-
-        tk.Label(right, text="Next refresh in",
-                 font=("Segoe UI", 11), fg="#94a3b8", bg="#1a1a2e").pack(anchor="w")
-        self.countdown_var = tk.StringVar(value="30s")
-        tk.Label(right, textvariable=self.countdown_var,
-                 font=("Segoe UI", 36, "bold"), fg="#38bdf8", bg="#1a1a2e").pack(anchor="w")
-        self.progress = ttk.Progressbar(right, length=200, mode="determinate",
-                                        maximum=QR_ROTATE_SECONDS)
-        self.progress.pack(anchor="w", pady=(4, 14))
-
-        tk.Label(right, text="Scan URL",
-                 font=("Segoe UI", 11), fg="#94a3b8", bg="#1a1a2e").pack(anchor="w")
-        self.url_var = tk.StringVar()
-        tk.Label(right, textvariable=self.url_var,
-                 font=("Segoe UI", 9), fg="#7dd3fc", bg="#1a1a2e",
-                 wraplength=210, justify="left").pack(anchor="w", pady=(0, 14))
-
-        tk.Label(right, text="Present  |  Late",
-                 font=("Segoe UI", 11), fg="#94a3b8", bg="#1a1a2e").pack(anchor="w")
-        self.count_var = tk.StringVar(value="0  |  0")
-        tk.Label(right, textvariable=self.count_var,
-                 font=("Segoe UI", 28, "bold"), fg="#4ade80", bg="#1a1a2e").pack(anchor="w")
-
-        tk.Label(right, text="Devices locked",
-                 font=("Segoe UI", 11), fg="#94a3b8", bg="#1a1a2e").pack(anchor="w", pady=(10,0))
-        self.device_var = tk.StringVar(value="0")
-        tk.Label(right, textvariable=self.device_var,
-                 font=("Segoe UI", 28, "bold"), fg="#a78bfa", bg="#1a1a2e").pack(anchor="w")
-
-        btn_frame = tk.Frame(self, bg="#1a1a2e", pady=10)
-        btn_frame.pack()
-        for text, cmd, color in [
-            ("Open Excel",     self._open_excel,      "#0f3460"),
-            ("Admin Panel",    self._open_admin,      "#1e3a5f"),
-            ("Absent List",    self._gen_absent,      "#713f12"),
-            ("Monthly Report", self._gen_monthly,     "#164e63"),
-            ("Reset Devices",  self._reset_devices,   "#312e81"),
-            ("Settings",       self._open_settings,   "#1e3a5f"),
-            ("Close",          self.destroy,           "#7f1d1d"),
-        ]:
-            tk.Button(btn_frame, text=text, command=cmd,
-                      font=("Segoe UI", 8, "bold"),
-                      bg=color, fg="white", relief="flat",
-                      padx=8, pady=7, cursor="hand2").pack(side="left", padx=2)
-
-        log_outer = tk.Frame(self, bg="#1a1a2e", padx=20, pady=0)
-        log_outer.pack(fill="x", pady=(0, 16))
-        tk.Label(log_outer, text="Recent check-ins",
-                 font=("Segoe UI", 10), fg="#94a3b8", bg="#1a1a2e").pack(anchor="w")
-        self.log_box = tk.Text(log_outer, height=5, width=72,
-                               bg="#0f172a", fg="#e2e8f0",
-                               font=("Consolas", 9), bd=0, state="disabled")
-        self.log_box.pack(fill="x")
-
-    def _make_qr_image(self, url):
-        qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_H,
-                           box_size=7, border=2)
-        qr.add_data(url); qr.make(fit=True)
-        return qr.make_image(fill_color="black", back_color="white")
-
-    def _refresh_qr(self):
-        with state_lock:
-            token = current_token
-        url = f"http://{self.server_ip}:{SERVER_PORT}/?token={token}"
-        self.url_var.set(url)
-        img   = self._make_qr_image(url)
-        img   = img.resize((240, 240), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
-        self.qr_label.configure(image=photo)
-        self.qr_label._img = photo
-
-    def _tick(self):
-        with state_lock:
-            remaining = max(0.0, token_expiry - time.time())
-        self.countdown_var.set(f"{int(remaining) + 1}s")
-        self.progress["value"] = remaining
-        today = datetime.now().strftime("%Y-%m-%d")
-        with state_lock:
-            present      = sum(1 for r in attendance_log if r["Date"] == today and r["Status"] == "Present")
-            late         = sum(1 for r in attendance_log if r["Date"] == today and r["Status"] == "Late")
-            device_count = len(submitted_ips)
-        self.count_var.set(f"{present}  |  {late}")
-        self.device_var.set(str(device_count))
-        if remaining < 0.3:
-            self.after(400, self._refresh_qr)
-        self._update_log()
-        self.after(250, self._tick)
-
-    def _update_log(self):
-        with state_lock:
-            recent = list(reversed(attendance_log[-5:]))
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        for r in recent:
-            tag  = "[P]" if r["Status"] == "Present" else ("[L]" if r["Status"] == "Late" else "[A]")
-            line = f"  {r['Time']}  |  {r['USN']:<14}  |  {r['Name']:<20}  |  {r['Branch']}-{r['Section']}  {tag}\n"
-            self.log_box.insert("end", line)
-        self.log_box.configure(state="disabled")
-
-    def _open_excel(self):
-        if os.path.exists(EXCEL_FILENAME):
-            if os.name == "nt": os.startfile(EXCEL_FILENAME)
-            else: os.system(f"xdg-open '{EXCEL_FILENAME}'")
-        else:
-            messagebox.showinfo("Info", "No attendance recorded yet.")
-
-    def _open_admin(self):
-        import webbrowser
-        pwd = simpledialog.askstring("Admin Panel", "Enter admin password:", show="*")
-        if pwd == ADMIN_PASSWORD:
-            webbrowser.open(f"http://localhost:{SERVER_PORT}/admin?pwd={pwd}")
-        elif pwd is not None:
-            messagebox.showerror("Error", "Wrong password!")
-
-    def _gen_absent(self):
-        if not ROLL_LIST:
-            messagebox.showinfo("Roll List Empty",
-                "No roll list found.\nOpen Settings and add USNs under 'Class Roll List' first.")
-            return
-        if not messagebox.askyesno("Generate Absent List",
-                "This will mark all students NOT in today's attendance as Absent.\nContinue?"):
-            return
-        count = generate_absent_list()
-        if count == 0:
-            messagebox.showinfo("Done", "All students have already marked attendance!")
-        else:
-            messagebox.showinfo("Done", f"{count} student(s) marked as Absent in Excel.")
-
-    def _gen_monthly(self):
-        ok = generate_monthly_summary()
-        if ok:
-            messagebox.showinfo("Done",
-                "Monthly Summary sheet created!\n\nGreen=85%+  |  Yellow=75-84%  |  Red=Below 75%")
-            if os.name == "nt": os.startfile(EXCEL_FILENAME)
-        else:
-            messagebox.showinfo("No Data", "No attendance data found for this month yet.")
-
-    def _reset_devices(self):
-        if not messagebox.askyesno("Reset Device Locks",
-                "This will allow all devices to submit attendance again.\n"
-                "Use this only if a student genuinely needs to resubmit.\nContinue?"):
-            return
-        with state_lock:
-            submitted_ips.clear()
-        messagebox.showinfo("Done", "Device locks cleared! All devices can submit again.")
-
-    def _open_settings(self):
-        dlg = SettingsDialog(self)
-        self.wait_window(dlg)
-        if dlg.result:
-            self.hdr_sub.config(
-                text=f"Subject: {SUBJECT}  |  {datetime.now().strftime('%A, %d %B %Y')}  |  Late after {LATE_AFTER_MINUTES} mins"
-            )
-
-
-# ─────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────
-def start_http_server():
-    server = ThreadedHTTPServer(("0.0.0.0", SERVER_PORT), AttendanceHandler)
-    server.serve_forever()
-
+# ══════════════════════════════════════════════
+#  START TOKEN ROTATION IN BACKGROUND
+# ══════════════════════════════════════════════
+rotator_thread = threading.Thread(target=rotate_token, daemon=True)
+rotator_thread.start()
+time.sleep(0.1)
 
 if __name__ == "__main__":
-    ip = get_local_ip()
-    if CLASS_START_TIME:
-        h, m = map(int, CLASS_START_TIME.split(":"))
-        class_start_dt = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
-    else:
-        class_start_dt = datetime.now()
-
-    t1 = threading.Thread(target=rotate_token, daemon=True)
-    t1.start()
-    time.sleep(0.1)
-
-    t2 = threading.Thread(target=start_http_server, daemon=True)
-    t2.start()
-
-    print(f"[OK] Server   : http://{ip}:{SERVER_PORT}")
-    print(f"[OK] Admin    : http://{ip}:{SERVER_PORT}/admin?pwd={ADMIN_PASSWORD}")
-    print(f"[OK] Subject  : {SUBJECT}")
-    print(f"[OK] QR rotates every {QR_ROTATE_SECONDS}s")
-    print(f"[OK] Late after {LATE_AFTER_MINUTES} mins")
-    print(f"[OK] Excel    : {EXCEL_FILENAME}")
-
-    app = AttendanceApp(ip)
-    app.mainloop()
+    port = int(os.environ.get("PORT", 5050))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
