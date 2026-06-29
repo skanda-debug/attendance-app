@@ -25,7 +25,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-QR_ROTATE_SECONDS  = 60
+QR_ROTATE_SECONDS  = 30
 EXCEL_FILENAME     = "attendance.xlsx"
 SUBJECT            = "DTL"
 LATE_AFTER_MINUTES = 10
@@ -146,6 +146,7 @@ def teacher_qr_page():
     <div class="stat"><div class="n device" id="cnt-device">0</div><div class="l">Devices</div></div>
   </div>
   <a class="footer-btn" href="/admin">Admin Panel</a>
+  <button class="footer-btn" onclick="location.reload()" style="margin-top:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);cursor:pointer;font-family:inherit;">Force Refresh</button>
 
 <script>
 const ROTATE = {QR_ROTATE_SECONDS};
@@ -155,12 +156,17 @@ let serverRemaining = ROTATE;
 let lastSync = Date.now();
 let lastTokenQR = "";
 let refreshing = false;
+let refreshStartedAt = 0;
 
 async function refresh() {{
-  if (refreshing) return;   // prevent overlapping calls from piling up
+  if (refreshing) return;
   refreshing = true;
+  refreshStartedAt = Date.now();
   try {{
-    const res = await fetch('/api/state', {{cache: 'no-store'}});
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // hard 8s timeout
+    const res = await fetch('/api/state', {{cache: 'no-store', signal: controller.signal}});
+    clearTimeout(timeoutId);
     if (!res.ok) throw new Error('Bad response: ' + res.status);
     const data = await res.json();
     if (data.qr !== lastTokenQR) {{
@@ -173,15 +179,19 @@ async function refresh() {{
     serverRemaining = data.remaining;
     lastSync = Date.now();
   }} catch(e) {{
-    console.error('refresh failed, will retry:', e);
-    // Don't freeze - force a retry shortly instead of leaving old state stuck
-    setTimeout(refresh, 1000);
+    console.error('refresh failed:', e);
   }} finally {{
     refreshing = false;
   }}
 }}
 
 function tick() {{
+  // Failsafe: if a refresh call has been "in progress" for more than 10s,
+  // something went wrong (e.g. Render cold-start hang) - force-unstick it.
+  if (refreshing && (Date.now() - refreshStartedAt) > 10000) {{
+    refreshing = false;
+  }}
+
   const elapsed = (Date.now() - lastSync) / 1000;
   let remaining = serverRemaining - elapsed;
   if (remaining <= 0.2 && !refreshing) {{
@@ -193,9 +203,8 @@ function tick() {{
 
 refresh();
 setInterval(tick, 250);
-// Hard safety net: force a refresh every 4s no matter what, so a stuck
-// state can never persist for more than a few seconds.
-setInterval(() => {{ if (!refreshing) refresh(); }}, 4000);
+// Absolute safety net: every 4s, force a refresh attempt regardless of flag state.
+setInterval(() => {{ refreshing = false; refresh(); }}, 4000);
 
 // re-sync immediately when the tab/screen becomes visible again
 // (fixes the "QR expired" issue caused by phone screen sleep / background throttling)
